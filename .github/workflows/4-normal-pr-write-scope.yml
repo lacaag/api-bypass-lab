@@ -1,0 +1,93 @@
+name: "Test 4: Normal (same-repo) PR - PATCH write scope audit"
+
+# LAB QUESTION: A PR from a branch on the SAME repo (not a fork) -
+# does the GITHUB_TOKEN have contents:write?
+# If yes: any contributor who can open a branch+PR can silently PATCH main.
+# Compare results against Test 1 (fork PR, blocked) and Test 2 (fork prt, write).
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  same-repo-pr-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Audit token and PR context"
+        run: |
+          echo "=== PR CONTEXT ==="
+          echo "Event: ${{ github.event_name }}"
+          echo "Head ref: ${{ github.head_ref }}"
+          echo "Base ref: ${{ github.base_ref }}"
+          echo "Is fork: ${{ github.event.pull_request.head.repo.fork }}"
+          echo "Head repo: ${{ github.event.pull_request.head.repo.full_name }}"
+          echo "Base repo: ${{ github.event.pull_request.base.repo.full_name }}"
+          echo ""
+          echo "=== REPO PERMISSIONS ==="
+          curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}" | jq '.permissions'
+
+      - name: "PATCH /refs (same SHA = no-op) - write permission probe"
+        id: patch
+        run: |
+          SHA=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/ref/heads/main" \
+            | jq -r '.object.sha')
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/p.json -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"$SHA\",\"force\":false}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/main")
+          echo "PATCH HTTP: $HTTP"
+          cat /tmp/p.json | jq '{sha:.object.sha,msg:.message}' 2>/dev/null
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "POST /git/blobs - write canary blob"
+        id: blob
+        run: |
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/b.json -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"content":"same-repo PR write probe","encoding":"utf-8"}' \
+            "https://api.github.com/repos/${{ github.repository }}/git/blobs")
+          echo "Blob HTTP: $HTTP | SHA: $(cat /tmp/b.json | jq -r '.sha // .message')"
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "POST /git/refs - create canary branch from PR"
+        id: branch
+        run: |
+          SHA=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/ref/heads/main" \
+            | jq -r '.object.sha')
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/br.json -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"ref\":\"refs/heads/canary-samepr-${{ github.run_id }}\",\"sha\":\"$SHA\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs")
+          echo "Create branch HTTP: $HTTP | $(cat /tmp/br.json | jq -r '.ref // .message')"
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "VERDICT"
+        run: |
+          echo "=============================================="
+          echo " SAME-REPO PR WRITE SCOPE - RESULTS"
+          echo "=============================================="
+          echo " PATCH /refs         : ${{ steps.patch.outputs.http }}"
+          echo " POST  /blobs        : ${{ steps.blob.outputs.http }}"
+          echo " POST  /refs (branch): ${{ steps.branch.outputs.http }}"
+          B="${{ steps.branch.outputs.http }}"
+          BL="${{ steps.blob.outputs.http }}"
+          if [ "$B" = "201" ] || [ "$BL" = "201" ]; then
+            echo ""
+            echo "[WRITE CONFIRMED] Same-repo PR has contents:write"
+            echo "Any PR from a branch on this repo can silently PATCH main"
+            echo "Combined with Test 3 (no branch protection): full history rewrite"
+          else
+            echo "[BLOCKED] Same-repo PR is also read-only"
+          fi

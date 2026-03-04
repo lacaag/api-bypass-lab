@@ -1,0 +1,98 @@
+name: "Test 1: Fork PR (pull_request) - PATCH silent push attempt"
+
+# LAB QUESTION: Fork PRs get read-only token. But can any technique
+# get PATCH /git/refs to succeed anyway?
+# Edge cases tested:
+#   - Direct PATCH (expected: 403)
+#   - Via actions/github-script (same token, same result)
+#   - Writing to the fork repo instead of upstream (different target)
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  workflow_dispatch:
+    inputs:
+      dummy:
+        description: "run manually for baseline comparison"
+        default: "true"
+
+permissions:
+  contents: write   # declared write - fork PRs override to read
+
+jobs:
+  fork-pr-patch-attempt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Token introspection"
+        run: |
+          echo "=== EVENT ==="
+          echo "Trigger: ${{ github.event_name }}"
+          echo "Head repo: ${{ github.event.pull_request.head.repo.full_name || 'N/A (dispatch)' }}"
+          echo "Is fork PR: ${{ github.event.pull_request.head.repo.fork || 'false' }}"
+          echo ""
+          echo "=== SETUP JOB PERMISSIONS ==="
+          # The setup job shows actual granted permissions
+          curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}" \
+            | jq '.permissions'
+
+      - name: "PATCH /refs/heads/main (force:false) - stealth overwrite attempt"
+        id: patch_noforce
+        run: |
+          SHA=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/ref/heads/main" \
+            | jq -r '.object.sha')
+          echo "Current main: $SHA"
+          HTTP=$(curl -s -w "%{http_code}" -o /dev/null -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"$SHA\",\"force\":false}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/main")
+          echo "PATCH force=false HTTP: $HTTP"
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "POST /git/refs - create canary branch (write test)"
+        id: create_branch
+        run: |
+          SHA=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/ref/heads/main" \
+            | jq -r '.object.sha')
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/cb.json -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"ref\":\"refs/heads/canary-pr-${{ github.run_id }}\",\"sha\":\"$SHA\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs")
+          RESULT=$(cat /tmp/cb.json | jq -r '.ref // .message')
+          echo "POST create branch HTTP: $HTTP | $RESULT"
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "POST /git/blobs - write blob (minimal write test)"
+        id: blob
+        run: |
+          HTTP=$(curl -s -w "%{http_code}" -o /tmp/blob.json -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"content":"aGVsbG8=","encoding":"base64"}' \
+            "https://api.github.com/repos/${{ github.repository }}/git/blobs")
+          RESULT=$(cat /tmp/blob.json | jq -r '.sha // .message')
+          echo "POST blob HTTP: $HTTP | $RESULT"
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+
+      - name: "VERDICT"
+        run: |
+          echo "======================================================="
+          echo " FORK PR (pull_request) WRITE PRIMITIVE TEST RESULTS"
+          echo "======================================================="
+          echo " PATCH /refs (force:false) : ${{ steps.patch_noforce.outputs.http }}"
+          echo " POST  /refs (new branch)  : ${{ steps.create_branch.outputs.http }}"
+          echo " POST  /blobs (write test) : ${{ steps.blob.outputs.http }}"
+          echo ""
+          P="${{ steps.patch_noforce.outputs.http }}"
+          B="${{ steps.create_branch.outputs.http }}"
+          BL="${{ steps.blob.outputs.http }}"
+          if [ "$B" = "201" ] || [ "$BL" = "201" ]; then
+            echo "[!!!] UNEXPECTED WRITE: fork PR pull_request has write access"
+          else
+            echo "[OK] Blocked as expected: fork PR pull_request = read-only"
+            echo "     Compare against Test 2 (pull_request_target) for bypass confirmation"
+          fi
